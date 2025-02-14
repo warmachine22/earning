@@ -1,0 +1,432 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Earnings Move Analysis</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/axios/1.6.2/axios.min.js"></script>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      max-width: 800px;
+      margin: 20px auto;
+      padding: 0 20px;
+    }
+    .form-group {
+      margin-bottom: 15px;
+    }
+    label {
+      display: block;
+      margin-bottom: 5px;
+      font-weight: bold;
+    }
+    input, select {
+      width: 100%;
+      padding: 8px;
+      margin-bottom: 10px;
+      border: 1px solid #ddd;
+      border-radius: 4px;
+      box-sizing: border-box;
+    }
+    button[type="submit"] {
+      background: #28a745;
+      color: white;
+      padding: 10px 20px;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+    }
+    button[type="submit"]:hover {
+      background: #218838;
+    }
+    #error {
+      color: red;
+      margin: 10px 0;
+    }
+    #loading {
+      display: none;
+      margin: 20px 0;
+    }
+    .summary-table {
+      width: 100%;
+      margin: 20px 0;
+      border-collapse: collapse;
+      background: white;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+    }
+    .summary-table th {
+      background: #f8f9fa;
+      padding: 12px;
+      border: 1px solid #dee2e6;
+      text-align: left;
+      font-weight: 600;
+    }
+    .summary-table td {
+      padding: 12px;
+      border: 1px solid #dee2e6;
+    }
+    .summary-table tr:hover {
+      background-color: #f8f9fa;
+    }
+    .period-column {
+      font-weight: 600;
+      color: #495057;
+    }
+    .details-table {
+      display: none;
+      margin-top: 20px;
+    }
+    .details-table.visible {
+      display: block;
+    }
+    .details-table table {
+      width: 100%;
+      border-collapse: collapse;
+    }
+    .details-table th, .details-table td {
+      padding: 8px;
+      border: 1px solid #dee2e6;
+      text-align: left;
+    }
+    .toggle-table {
+      background: #007bff;
+      color: white;
+      padding: 10px 20px;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+      margin: 20px 0;
+      display: block;
+      width: 100%;
+    }
+    .toggle-table:hover {
+      background: #0056b3;
+    }
+    .stock-header {
+      font-size: 1.5em;
+      color: #333;
+      margin-bottom: 20px;
+      padding-bottom: 10px;
+      border-bottom: 2px solid #007bff;
+    }
+    .positive { color: green; }
+    .negative { color: red; }
+  </style>
+</head>
+<body>
+  <h1>Earnings Move Analysis</h1>
+  
+  <form id="analysisForm">
+    <div class="form-group">
+      <label for="apiKey">Alpha Vantage API Key:</label>
+      <input type="text" id="apiKey" required>
+    </div>
+    
+    <div class="form-group">
+      <label for="symbol">Stock Symbol:</label>
+      <input type="text" id="symbol" required>
+    </div>
+    
+    <div class="form-group">
+      <label for="analysisType">Analysis Scenario:</label>
+      <select id="analysisType">
+        <option value="post">Earnings Post-Move (Buy at close on earnings day, sell at close after N days)</option>
+        <option value="pre">Pre-Earnings Move (Buy at close N days prior, sell at open on earnings day)</option>
+        <option value="intraday">Intraday Earnings Move (Buy at open, sell at close on earnings day)</option>
+      </select>
+    </div>
+    
+    <div class="form-group" id="offsetInputGroup">
+      <label for="dayOffset">Day Offset (for pre/post moves):</label>
+      <input type="number" id="dayOffset" min="0" value="3" required>
+    </div>
+    
+    <button type="submit">Analyze</button>
+  </form>
+
+  <div id="error"></div>
+  <div id="loading">Loading data...</div>
+  <div id="results"></div>
+
+  <script>
+    // Fetch daily stock price data (includes open and close prices)
+    async function fetchStockData(symbol, apiKey) {
+      try {
+        const response = await axios.get('https://www.alphavantage.co/query', {
+          params: {
+            function: 'TIME_SERIES_DAILY',
+            symbol: symbol,
+            outputsize: 'full',
+            apikey: apiKey
+          }
+        });
+        const data = response.data['Time Series (Daily)'];
+        if (!data) {
+          throw new Error('No stock price data received from Alpha Vantage API');
+        }
+        // Convert the time series object to an array and sort by date ascending
+        return Object.entries(data)
+          .map(([date, values]) => ({
+            date,
+            open: parseFloat(values['1. open']),
+            close: parseFloat(values['4. close'])
+          }))
+          .sort((a, b) => new Date(a.date) - new Date(b.date));
+      } catch (error) {
+        throw new Error(`Failed to fetch stock data: ${error.message}`);
+      }
+    }
+
+    // Fetch quarterly earnings data from Alpha Vantage
+    async function fetchEarningsData(symbol, apiKey) {
+      try {
+        const response = await axios.get('https://www.alphavantage.co/query', {
+          params: {
+            function: 'EARNINGS',
+            symbol: symbol,
+            apikey: apiKey
+          }
+        });
+        const data = response.data['quarterlyEarnings'];
+        if (!data) {
+          throw new Error('No earnings data received from Alpha Vantage API');
+        }
+        return data;
+      } catch (error) {
+        throw new Error(`Failed to fetch earnings data: ${error.message}`);
+      }
+    }
+
+    // Helper: Find first trading day on or after a target date
+    function findTradingDayOnOrAfter(stockData, targetDate) {
+      for (let item of stockData) {
+        if (new Date(item.date) >= targetDate) {
+          return item;
+        }
+      }
+      return null;
+    }
+
+    // Helper: Find last trading day on or before a target date
+    function findTradingDayOnOrBefore(stockData, targetDate) {
+      for (let i = stockData.length - 1; i >= 0; i--) {
+        if (new Date(stockData[i].date) <= targetDate) {
+          return stockData[i];
+        }
+      }
+      return null;
+    }
+
+    // Calculate returns based on selected scenario
+    function calculateScenarioReturns(stockData, earningsData, analysisType, dayOffset) {
+      const results = [];
+      earningsData.forEach(event => {
+        const earningsDate = new Date(event.reportedDate);
+        if (isNaN(earningsDate.getTime())) return; // Skip invalid dates
+
+        if (analysisType === 'intraday') {
+          // Find the trading day for earnings (should match earnings date)
+          const tradingDay = findTradingDayOnOrAfter(stockData, earningsDate);
+          if (!tradingDay || (Math.abs(new Date(tradingDay.date) - earningsDate) > 86400000)) return;
+          const startPrice = tradingDay.open;
+          const endPrice = tradingDay.close;
+          const moveReturn = ((endPrice - startPrice) / startPrice) * 100;
+          results.push({
+            earningsDate: event.reportedDate,
+            startDate: tradingDay.date,
+            endDate: tradingDay.date,
+            startPrice,
+            endPrice,
+            return: moveReturn,
+            scenario: 'Intraday (open-to-close)'
+          });
+        } else if (analysisType === 'post') {
+          // Use earnings date as anchor: buy at close on earnings day, sell after N days (at close)
+          const earningsTradingDay = findTradingDayOnOrAfter(stockData, earningsDate);
+          if (!earningsTradingDay) return;
+          const startPrice = earningsTradingDay.close;
+          const targetDate = new Date(earningsDate);
+          targetDate.setDate(targetDate.getDate() + dayOffset);
+          const postTradingDay = findTradingDayOnOrAfter(stockData, targetDate);
+          if (!postTradingDay) return;
+          const endPrice = postTradingDay.close;
+          const moveReturn = ((endPrice - startPrice) / startPrice) * 100;
+          results.push({
+            earningsDate: event.reportedDate,
+            startDate: earningsTradingDay.date,
+            endDate: postTradingDay.date,
+            startPrice,
+            endPrice,
+            return: moveReturn,
+            scenario: `Post-Move (${dayOffset} day offset)`
+          });
+        } else if (analysisType === 'pre') {
+          // Use earnings date as anchor: buy N days before (at close), sell at open on earnings day
+          const targetPreDate = new Date(earningsDate);
+          targetPreDate.setDate(targetPreDate.getDate() - dayOffset);
+          const preTradingDay = findTradingDayOnOrBefore(stockData, targetPreDate);
+          if (!preTradingDay) return;
+          const earningsTradingDay = findTradingDayOnOrAfter(stockData, earningsDate);
+          if (!earningsTradingDay) return;
+          const startPrice = preTradingDay.close;
+          const endPrice = earningsTradingDay.open;
+          const moveReturn = ((endPrice - startPrice) / startPrice) * 100;
+          results.push({
+            earningsDate: event.reportedDate,
+            startDate: preTradingDay.date,
+            endDate: earningsTradingDay.date,
+            startPrice,
+            endPrice,
+            return: moveReturn,
+            scenario: `Pre-Move (${dayOffset} day offset)`
+          });
+        }
+      });
+      // Sort results by earnings date
+      results.sort((a, b) => new Date(a.earningsDate) - new Date(b.earningsDate));
+      return results;
+    }
+
+    // Calculate summary statistics
+    function calculateSummaryStats(returns) {
+      const total = returns.length;
+      if (total === 0) return { averageReturn: 0, successRate: 0, totalEvents: 0, positiveEvents: 0 };
+      const sumReturn = returns.reduce((acc, item) => acc + item.return, 0);
+      const avgReturn = sumReturn / total;
+      const positiveCount = returns.filter(item => item.return >= 0).length;
+      const successRate = (positiveCount / total) * 100;
+      return {
+        averageReturn: avgReturn.toFixed(2),
+        successRate: successRate.toFixed(2),
+        totalEvents: total,
+        positiveEvents: positiveCount
+      };
+    }
+
+    // Display the summary and detailed results
+    function displayResults(returns, analysisType, dayOffset, symbol) {
+      const resultsDiv = document.getElementById('results');
+      if (returns.length === 0) {
+        resultsDiv.innerHTML = 'No earnings events found with available stock price data.';
+        return;
+      }
+
+      const stats = calculateSummaryStats(returns);
+      let summaryTableHtml = `
+        <div class="stock-header">
+          Earnings Analysis for ${symbol.toUpperCase()} (${analysisType === 'intraday' ? 'Intraday (open-to-close)' : analysisType === 'post' ? `Post-Move (${dayOffset} day offset)` : `Pre-Move (${dayOffset} day offset)`})
+        </div>
+        <table class="summary-table">
+          <thead>
+            <tr>
+              <th>Total Earnings Events</th>
+              <th>Average Return</th>
+              <th>Success Rate</th>
+              <th>Positive Events</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>${stats.totalEvents}</td>
+              <td>${stats.averageReturn}%</td>
+              <td>${stats.successRate}%</td>
+              <td>${stats.positiveEvents} out of ${stats.totalEvents}</td>
+            </tr>
+          </tbody>
+        </table>
+      `;
+
+      const detailsRows = returns.map(item => `
+        <tr>
+          <td>${item.earningsDate}</td>
+          <td>${item.startDate} → ${item.endDate}<br><small>${item.scenario}</small></td>
+          <td>$${item.startPrice.toFixed(2)}</td>
+          <td>$${item.endPrice.toFixed(2)}</td>
+          <td class="${item.return >= 0 ? 'positive' : 'negative'}">${item.return.toFixed(2)}%</td>
+        </tr>
+      `).join('');
+
+      resultsDiv.innerHTML = `
+        ${summaryTableHtml}
+        <button class="toggle-table" onclick="toggleDetailsTable()">Show Detailed Results</button>
+        <div class="details-table" id="detailsTable">
+          <table>
+            <thead>
+              <tr>
+                <th>Earnings Report Date</th>
+                <th>Period (Start → End)</th>
+                <th>Start Price</th>
+                <th>End Price</th>
+                <th>Return</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${detailsRows}
+            </tbody>
+          </table>
+        </div>
+      `;
+    }
+
+    function toggleDetailsTable() {
+      const table = document.getElementById('detailsTable');
+      const button = document.querySelector('.toggle-table');
+      const isVisible = table.classList.toggle('visible');
+      button.textContent = isVisible ? 'Hide Detailed Results' : 'Show Detailed Results';
+    }
+
+    // Toggle the day offset input when the analysis type changes
+    document.getElementById('analysisType').addEventListener('change', (e) => {
+      const offsetGroup = document.getElementById('offsetInputGroup');
+      if (e.target.value === 'intraday') {
+        offsetGroup.style.display = 'none';
+      } else {
+        offsetGroup.style.display = 'block';
+      }
+    });
+
+    // Main form submission handler
+    document.getElementById('analysisForm').addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const errorDiv = document.getElementById('error');
+      const loadingDiv = document.getElementById('loading');
+      const resultsDiv = document.getElementById('results');
+      errorDiv.innerHTML = '';
+      loadingDiv.style.display = 'block';
+      resultsDiv.innerHTML = '';
+
+      try {
+        const apiKey = document.getElementById('apiKey').value.trim();
+        const symbol = document.getElementById('symbol').value.trim();
+        const analysisType = document.getElementById('analysisType').value;
+        const dayOffset = analysisType === 'intraday' ? 0 : parseInt(document.getElementById('dayOffset').value, 10);
+        if (!apiKey) throw new Error('Please enter an Alpha Vantage API key');
+        if (!symbol) throw new Error('Please enter a stock symbol');
+        if (analysisType !== 'intraday' && (isNaN(dayOffset) || dayOffset < 0)) {
+          throw new Error('Please enter a valid day offset');
+        }
+
+        // Fetch both stock prices and earnings data
+        const stockData = await fetchStockData(symbol, apiKey);
+        const earningsData = await fetchEarningsData(symbol, apiKey);
+        const scenarioReturns = calculateScenarioReturns(stockData, earningsData, analysisType, dayOffset);
+        displayResults(scenarioReturns, analysisType, dayOffset, symbol);
+      } catch (error) {
+        errorDiv.innerHTML = error.message;
+      } finally {
+        loadingDiv.style.display = 'none';
+      }
+    });
+
+    // Optional: Load a saved API key from localStorage on DOM load
+    document.addEventListener('DOMContentLoaded', () => {
+      const savedApiKey = localStorage.getItem('alphavantageApiKey');
+      if (savedApiKey) {
+        document.getElementById('apiKey').value = savedApiKey;
+      }
+      // Trigger the change event to correctly show/hide offset field
+      document.getElementById('analysisType').dispatchEvent(new Event('change'));
+    });
+  </script>
+</body>
+</html>
